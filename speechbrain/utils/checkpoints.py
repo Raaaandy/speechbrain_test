@@ -167,6 +167,7 @@ def torch_recovery(obj, path, end_of_epoch):
     """
     del end_of_epoch  # Unused
     device = "cpu"
+    print("Debug: obj", obj, "at speechbrain/speechbrain/utils/checkpoints.py")
 
     state_dict = torch_patched_state_dict_load(path, device)
     try:
@@ -569,7 +570,7 @@ class Checkpointer:
         recoverables=None,
         custom_load_hooks=None,
         custom_save_hooks=None,
-        allow_partial_load=False,
+        allow_partial_load=True,
     ):
         self.checkpoints_dir = pathlib.Path(checkpoints_dir)
         os.makedirs(self.checkpoints_dir, exist_ok=True)
@@ -1134,11 +1135,14 @@ class Checkpointer:
         # recoverable, and calls it.
         logger.info(f"Loading a checkpoint from {checkpoint.path}")
         end_of_epoch = checkpoint.meta["end-of-epoch"]
+        print(self.recoverables.items())
         for name, obj in self.recoverables.items():
             # NOTE: We want the checkpoint namedtuple to have the paramfile
             # paths for each recoverable.
             # In some rare case, the user can e.g. add a path there manually.
             try:
+                # print("checkpoint.paramfiles", checkpoint.paramfiles)
+                # raise KeyboardInterrupt()
                 loadpath = checkpoint.paramfiles[name]
             except KeyError:
                 if self.allow_partial_load:

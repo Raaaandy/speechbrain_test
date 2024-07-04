@@ -473,6 +473,8 @@ class TransformerASR(TransformerInterface):
         elif self.attention_type == "RelPosMHAXL":
             pos_embs_source = self.positional_encoding(src)
         elif self.positional_encoding_type == "fixed_abs_sine":
+            print("positional encoding", self.positional_encoding(src).shape)
+            print("src", src.shape)
             src = src + self.positional_encoding(src)
             pos_embs_source = None
 

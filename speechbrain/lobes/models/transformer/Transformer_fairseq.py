@@ -3,6 +3,15 @@ Authors
 * Jianyuan Zhong 2020
 * Samuele Cornell 2021
 """
+import re
+from dataclasses import dataclass, field, fields
+from typing import List, Optional
+
+from omegaconf import II
+
+from fairseq import utils
+from fairseq.dataclass import ChoiceEnum, FairseqDataclass
+from fairseq.utils import safe_getattr, safe_hasattr
 
 import math
 from typing import Optional
@@ -19,7 +28,140 @@ from speechbrain.utils.checkpoints import map_old_state_dict_weights
 
 from .Branchformer import BranchformerEncoder
 from .Conformer import ConformerEncoder
+from fairseq.models.transformer.transformer_config import TransformerConfig
 
+from Monotonic_mutihead_attention import MonotonicInfiniteLookbackAttention
+from fairseq.modules import MultiheadAttention
+
+class EncDecBaseConfig(FairseqDataclass):
+    embed_path: Optional[str] = field(
+        default=None, metadata={"help": "path to pre-trained embedding"}
+    )
+    embed_dim: Optional[int] = field(
+        default=512, metadata={"help": "embedding dimension"}
+    )
+    ffn_embed_dim: int = field(
+        default=2048, metadata={"help": "embedding dimension for FFN"}
+    )
+    layers: int = field(default=6, metadata={"help": "number of layers"})
+    attention_heads: int = field(
+        default=8, metadata={"help": "number of attention heads"}
+    )
+    normalize_before: bool = field(
+        default=False, metadata={"help": "apply layernorm before each block"}
+    )
+    learned_pos: bool = field(
+        default=False, metadata={"help": "use learned positional embeddings"}
+    )
+    # args for "Reducing Transformer Depth on Demand with Structured Dropout" (Fan et al., 2019)
+    layerdrop: float = field(default=0, metadata={"help": "LayerDrop probability"})
+    layers_to_keep: Optional[List[int]] = field(
+        default=None, metadata={"help": "which layers to *keep* when pruning"}
+    )
+
+    xformers_att_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "config for xFormers attention, defined in xformers.components.attention.AttentionConfig"
+        },
+    )
+
+class QuantNoiseConfig(FairseqDataclass):
+    pq: float = field(
+        default=0.0,
+        metadata={"help": "iterative PQ quantization noise at training time"},
+    )
+    pq_block_size: int = field(
+        default=8,
+        metadata={"help": "block size of quantization noise at training time"},
+    )
+    scalar: float = field(
+        default=0.0,
+        metadata={
+            "help": "scalar quantization noise and scalar quantization at training time"
+        },
+    )
+
+class DecoderConfig(EncDecBaseConfig):
+    input_dim: int = II("model.decoder.embed_dim")
+    output_dim: int = field(
+        default=II("model.decoder.embed_dim"),
+        metadata={
+            "help": "decoder output dimension (extra linear layer if different from decoder embed dim)"
+        },
+    )
+
+    def __post_init__(self):
+        #  II doesn't work if we are just creating the object outside of hydra so fix that
+        if self.input_dim == II("model.decoder.embed_dim"):
+            self.input_dim = self.embed_dim
+        if self.output_dim == II("model.decoder.embed_dim"):
+            self.output_dim = self.embed_dim
+
+args = TransformerConfig(
+    _name='transformer_monotonic_iwslt_de_en',
+    activation_fn='relu',
+    dropout=0.3,
+    attention_dropout=0.0,
+    activation_dropout=0.0,
+    adaptive_input=False,
+    encoder=EncDecBaseConfig(
+        _name='transformer_monotonic_iwslt_de_en',
+        embed_path=None,
+        embed_dim=512,
+        ffn_embed_dim=1024,
+        layers=6,
+        attention_heads=4,
+        normalize_before=False,
+        learned_pos=False,
+        layerdrop=0,
+        layers_to_keep=None
+    ),
+    max_source_positions=1024,
+    decoder=DecoderConfig(
+        _name='transformer_monotonic_iwslt_de_en',
+        embed_path=None,
+        embed_dim=512,
+        ffn_embed_dim=1024,
+        layers=6,
+        attention_heads=4,
+        normalize_before=False,
+        learned_pos=False,
+        layerdrop=0,
+        layers_to_keep=None,
+        input_dim=512,
+        output_dim=512
+    ),
+    max_target_positions=1024,
+    share_decoder_input_output_embed=False,
+    share_all_embeddings=False,
+    no_token_positional_embeddings=False,
+    adaptive_softmax_cutoff=None,
+    adaptive_softmax_dropout=0,
+    adaptive_softmax_factor=4,
+    layernorm_embedding=False,
+    tie_adaptive_weights=False,
+    tie_adaptive_proj=False,
+    no_scale_embedding=False,
+    checkpoint_activations=False,
+    offload_activations=False,
+    no_cross_attention=False,
+    cross_self_attention=False,
+    quant_noise=QuantNoiseConfig(
+        _name='transformer_monotonic_iwslt_de_en',
+        pq=0,
+        pq_block_size=8,
+        scalar=0
+    ),
+    min_params_to_wrap=100000000,
+    char_inputs=False,
+    relu_dropout=0.0,
+    base_layers=0,
+    base_sublayers=1,
+    base_shuffle=1,
+    export=False,
+    no_decoder_final_norm=False
+)
 
 class TransformerInterface(nn.Module):
     """This is an interface for transformer model.
@@ -276,7 +418,6 @@ class PositionalEncoding(nn.Module):
         -------
         The positional encoding.
         """
-
         return self.pe[:, : x.size(1)].clone().detach()
 
 
@@ -650,25 +791,27 @@ class TransformerDecoderLayer(nn.Module):
         normalize_before=False,
         attention_type="regularMHA",
         causal=None,
+        args=None
     ):
         super().__init__()
         self.nhead = nhead
 
+        self.args = args
         if attention_type == "regularMHA":
-            self.self_attn = sb.nnet.attention.MultiheadAttention(
-                nhead=nhead,
-                d_model=d_model,
-                kdim=kdim,
-                vdim=vdim,
-                dropout=dropout,
+
+            self.self_attn = MultiheadAttention(
+                args.decoder.embed_dim,
+                self.args.decoder.attention_heads,
+                dropout=self.args.attention_dropout,
+                add_bias_kv=False,
+                add_zero_attn=False,
+                self_attention=not self.argss.cross_self_attention,
+                q_noise=self.quant_noise,
+                qn_block_size=self.quant_noise_block_size,
+                xformers_att_config=self.args.decoder.xformers_att_config,
             )
-            self.multihead_attn = sb.nnet.attention.MultiheadAttention(
-                nhead=nhead,
-                d_model=d_model,
-                 kdim=kdim,
-                 vdim=vdim,
-                 dropout=dropout,
-            )
+            self.multihead_attn = MonotonicInfiniteLookbackAttention(args)
+            print("Debug at /gscratch/intelligentsystems/randy/speechbrain/speechbrain/lobes/models/transformer/Transformer.py", self.multihead_attn)
 
         elif attention_type == "RelPosMHAXL":
             self.self_attn = sb.nnet.attention.RelPosMHAXL(

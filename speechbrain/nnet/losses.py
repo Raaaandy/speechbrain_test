@@ -15,6 +15,28 @@ import math
 from collections import namedtuple
 from itertools import permutations
 
+from dataclasses import dataclass, field
+import torch
+from fairseq import metrics, utils
+from fairseq.criterions import register_criterion
+from fairseq.criterions.label_smoothed_cross_entropy import (
+    LabelSmoothedCrossEntropyCriterion,
+    LabelSmoothedCrossEntropyCriterionConfig
+)
+try:
+    from simuleval.metrics.latency import (
+        AverageLagging,
+        AverageProportion,
+        DifferentiableAverageLagging
+    )
+    LATENCY_METRICS = {
+        "average_lagging": AverageLagging,
+        "average_proportion": AverageProportion,
+        "differentiable_average_lagging":  DifferentiableAverageLagging,
+    }
+except ImportError:
+    LATENCY_METRICS = None
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -415,6 +437,151 @@ def classification_error(
         error, probabilities, targets.long(), length, reduction=reduction
     )
 
+def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
+    if target.dim() == lprobs.dim() - 1:
+        target = target.unsqueeze(-1)
+    nll_loss = -lprobs.gather(dim=-1, index=target)
+    smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
+    if ignore_index is not None:
+        pad_mask = target.eq(ignore_index)
+        nll_loss.masked_fill_(pad_mask, 0.0)
+        smooth_loss.masked_fill_(pad_mask, 0.0)
+    else:
+        nll_loss = nll_loss.squeeze(-1)
+        smooth_loss = smooth_loss.squeeze(-1)
+    if reduce:
+        nll_loss = nll_loss.sum()
+        smooth_loss = smooth_loss.sum()
+    eps_i = epsilon / (lprobs.size(-1) - 1)
+    print("eps_i", eps_i)
+    print("nll_loss", nll_loss)
+    print("smooth_loss", smooth_loss)
+    loss = (1.0 - epsilon - eps_i) * nll_loss + eps_i * smooth_loss
+    return loss, nll_loss
+
+def compute_latency_loss(sample, net_output):
+    assert (
+        net_output[-1].encoder_padding_mask is None
+        or not net_output[-1].encoder_padding_mask[:, 0].any()
+    ), (
+        "Only right padding on source is supported."
+    )
+    # 1. Obtain the expected alignment
+    alpha_list = [item["alpha"] for item in net_output[1].attn_list]
+    num_layers = len(alpha_list)
+    bsz, num_heads, tgt_len, src_len = alpha_list[0].size()
+
+    # bsz * num_layers * num_heads, tgt_len, src_len
+    alpha_all = torch.cat(alpha_list, dim=1).view(-1, tgt_len, src_len)
+
+    # 2 compute expected delays
+    # bsz * num_heads * num_layers, tgt_len, src_len for MMA
+    steps = (
+        torch.arange(1, 1 + src_len)
+        .unsqueeze(0)
+        .unsqueeze(1)
+        .expand_as(alpha_all)
+        .type_as(alpha_all)
+    )
+
+    expected_delays = torch.sum(steps * alpha_all, dim=-1)
+    padding_idx = 1
+    target_padding_mask = (
+        # model.get_targets(sample, net_output)
+        #sample["target"]
+        sample
+        .eq(padding_idx)
+        .eq(1)
+        .unsqueeze(1)
+        .expand(bsz, num_layers * num_heads, tgt_len)
+        .contiguous()
+        .view(-1, tgt_len)
+    )
+    input_src_len = torch.full((bsz,), src_len)
+    src_lengths = (
+        # sample["net_input"]["src_lengths"]
+        input_src_len
+        .unsqueeze(1)
+        .expand(bsz, num_layers * num_heads)
+        .contiguous()
+        .view(-1)
+    )
+    expected_latency = LATENCY_METRICS["differentiable_average_lagging"](
+        expected_delays, src_lengths, None,
+        target_padding_mask=target_padding_mask
+    )
+
+    # 2.1 average expected latency of heads
+    # bsz, num_layers * num_heads
+    expected_latency = expected_latency.view(bsz, -1)
+    weights = torch.nn.functional.softmax(expected_latency, dim=1)
+    expected_latency = torch.sum(expected_latency * weights, dim=1)
+
+
+    expected_latency = expected_latency.sum()
+    avg_loss = 1e-3 * expected_latency
+    # avg_loss = 0.1 * expected_latency
+
+    # 2.2 variance of expected delays
+    expected_delays_var = (
+        expected_delays.view(bsz, -1, tgt_len).var(dim=1).mean(dim=1)
+    )
+    expected_delays_var = expected_delays_var.sum()
+    var_loss = 0.1 * expected_delays_var
+
+    # 3. Final loss
+    print("avg_loss", avg_loss)
+    print("var_loss", var_loss)
+    
+    latency_loss = avg_loss + var_loss
+
+    return latency_loss, expected_latency, expected_delays_var
+
+
+def latency_loss(
+    log_probabilities,
+    targets,
+    length=None,
+    label_smoothing=1e-6,
+    allowed_len_diff=3,
+    reduction="mean",
+    net_output = None,
+):
+    """
+    compute latency loss
+    """
+    assert LATENCY_METRICS is not None, "Please make sure correctly import"
+    loss, nll_loss = label_smoothed_nll_loss(
+        lprobs=log_probabilities,
+        target=targets,
+        epsilon=label_smoothing,
+        ignore_index=0,
+        reduce=True
+    )
+    print("log_probabilities", log_probabilities.shape)
+    print("targets", targets.shape)
+    print("loss", loss)
+    # print("nll_loss", nll_loss)
+    assert net_output is not None, "Pass in your output"
+    sample_size = targets.size(0)
+    alpha_list = [item["alpha"] for item in net_output[1].attn_list]
+    latency_loss, expected_latency, expected_delays_var = compute_latency_loss(
+        targets, net_output=net_output
+    )
+    loss += latency_loss
+    logging_output = {
+        "loss": loss.data,
+        "nll_loss": nll_loss.data,
+        "ntokens": targets.size(0),
+        "nsentences": targets.size(0),
+        "sample_size": sample_size,
+        "latency": expected_latency,
+        "delays_var": expected_delays_var,
+        "latency_loss": latency_loss,
+    }
+    return loss, sample_size, logging_output
+
+    
 
 def nll_loss(
     log_probabilities,

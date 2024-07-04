@@ -13,12 +13,131 @@ from functools import cached_property
 import torch
 from torch.distributions import Categorical
 
+from fairseq.models.transformer.transformer_config import (
+    TransformerConfig, EncDecBaseConfig, DecoderConfig, QuantNoiseConfig
+    )
+
 from speechbrain.decoders.utils import (
     _update_mem,
     inflate_tensor,
     mask_by_condition,
 )
 from speechbrain.utils.data_utils import undo_padding
+
+
+class StreamingAgent():
+
+    def __init__(self, modules, eos_index, bos_index, tgt_dict = {}, src_dict = {}):
+        
+        self.gpu = torch.cuda.is_available()
+
+        self.max_len = 1000000
+
+        self.encoder_1 = modules[1]
+        self.encoder_2 = modules[2]
+        self.decoder = modules[0]
+
+
+
+        self.eos = eos_index
+        self.bos = bos_index
+
+        self.source = []
+
+        self.target = []
+
+        self.read_step = 0
+
+        self.input_len = 0
+
+        self.states = {}
+        self.states["online"] = {}
+
+        self.dict = {}
+        self.dict["tgt"] = tgt_dict
+        self.dict["src"] = src_dict
+
+
+    def to_device(self, tensor):
+        if self.gpu:
+            return tensor.cuda()
+        else:
+            return tensor.cpu()
+    
+    def update_model_encoder(self, wavs):
+        if len(self.source) == 0:
+            return
+        
+        src_indices = [
+            self.dict["src"].index(token) for token in self.source if token is not None
+        ]
+
+        if self.states["online"]["only"]:
+            src_indices += [self.eos]
+
+        src_indices = self.to_device(
+            torch.LongTensor(src_indices).unsqueeze(0)
+        )
+        src_lengths = self.to_device(
+            torch.LongTensor([src_indices.size(1)])
+        )
+
+        self.states["encoder_states"] = self.encoder_2(self.encoder_1(src_indices, src_lengths))
+
+    def output_judge(self, encoder_out: torch.Tensor):
+        # T * B * C
+        
+        self.input_len = encoder_out.size(0)
+        if self.input_len == 0:
+            raise UserWarning("No input")
+        
+        if self.read_step == 0:
+            self.source.append(encoder_out[self.read_step])
+            self.read_step += 1
+        # previous output encoded
+        prev_pred = self.to_device(
+            torch.LongTensor(
+                [self.bos]
+                + [
+                    self.tgt_dict.index(token)
+                    for token in self.target
+                    if token is not None
+                ]
+            ).unsqueeze(0)
+        )
+
+        src_len = encoder_out[0].size(0)
+        tgt_len = 1 + len(self.target)
+        if self.read_step >= src_len:
+            self.states["online"]["only"] = torch.BoolTensor([False])
+        else:
+            self.states["online"]["only"] = torch.BoolTensor([True])
+        
+        x, outputs = self.decoder.extract_features(prev_pred, encoder_out, self.states)
+        self.states["dec_out"] = x
+        torch.cuda.empty_cache()
+        return outputs.action == 1
+        
+    def predict(self):
+        decoder_out = self.states["dec_out"]
+        lprobs = self.decoder.get_normalized_probs([decoder_out[:, -1:]], log_probs=True)
+        logits = lprobs[:, -1, :]
+        index = lprobs.argmax(dim=-1)[0, 0].item()
+
+        if index != self.eos:
+            token = index
+            print(index)
+            # token = self.dict["tgt"][index]
+        else:
+            token = self.eos
+
+        return token
+
+        
+
+
+    
+
 
 
 class AlivedHypotheses(torch.nn.Module):

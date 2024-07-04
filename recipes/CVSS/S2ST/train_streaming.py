@@ -44,60 +44,30 @@ class S2UT(sb.core.Brain):
             The outputs after all processing is complete.
         """
         batch = batch.to(self.device)
-        attributes = dir(batch)
-        attributes = [attr for attr in attributes if not (attr.startswith('__') and attr.endswith('__'))]
-        for attr in attributes:
-            print(f"{attr}: {getattr(batch, attr)}")
         wavs, wav_lens = batch.src_sig
-        ## wave padding idx
-
-
         tokens_bos, _ = batch.code_bos
 
         # Use default padding value for wav2vec2
         wavs[wavs == self.hparams.pad_index] = 0.0
-        preprocess
+
         # compute features
         enc_out = self.modules.wav2vec2(wavs, wav_lens)
 
-        if (torch.isnan(enc_out).any()):
-            raise KeyboardInterrupt("wav2vec2 enc_out")
-        for name, param in self.modules.enc.named_parameters():
-            if torch.isnan(param).any():
-                print(f"Parameter '{name}' contains NaN values.")
-                # raise KeyboardInterrupt("module weights contain NaN values")
         # dimensionality reduction
         enc_out = self.modules.enc(enc_out)
 
-        
-        if (torch.isnan(enc_out).any()):
-            print(enc_out.shape)
-            raise KeyboardInterrupt("enc enc_out")
-        ## make input compatible with transformer
-        enc_out = enc_out.transpose(0, 1)
-        bsz = enc_out.size(0)
-
         if isinstance(self.modules.transformer, DistributedDataParallel):
-            dec_out, atten = self.modules.transformer.module(prev_output_tokens=tokens_bos, encoder_out=enc_out)
-            print()
-            # dec_out = self.modules.transformer.module.forward_mt_decoder_only(
-            #     enc_out, tokens_bos, pad_idx=self.hparams.pad_index
-            # )
+            dec_out = self.modules.transformer.module.forward_mt_decoder_only(
+                enc_out, tokens_bos, pad_idx=self.hparams.pad_index
+            )
         else:
-            if (torch.isnan(tokens_bos).any()):
-                raise KeyboardInterrupt("train.compute forward token bos")
-            if (torch.isnan(enc_out).any()):
-                raise KeyboardInterrupt("train.compute forward encoder out")
-            net_output = self.modules.transformer(prev_output_tokens=tokens_bos, encoder_out=enc_out)
-            
-            # dec_out = self.modules.transformer.forward_mt_decoder_only(
-            #     enc_out, tokens_bos, pad_idx=self.hparams.pad_index
-            # )
-        p_seq = self.modules.transformer.get_normalized_probs(net_output, log_probs=True)
-        print("dec out greater than 0",p_seq.ge(0).all())
-        atten = net_output[1]
+            dec_out = self.modules.transformer.forward_mt_decoder_only(
+                enc_out, tokens_bos, pad_idx=self.hparams.pad_index
+            )
+
         # logits and softmax
-        # p_seq = dec_out
+        pred = self.modules.seq_lin(dec_out)
+        p_seq = self.hparams.log_softmax(pred)
 
         hyps = None
         wavs = None
@@ -119,14 +89,7 @@ class S2UT(sb.core.Brain):
                 )
                 # print(enc_out.shape)
                 # print(len(tgt_text), tgt_text)
-                # hyps, _, _, _ = search(enc_out.detach(), wav_lens)
-                # print("Debug: enc_out", enc_out.detach().size())
-                hyps = []
-                for batch in enc_out.transpose(0, 1):
-                    batch_output = self.generate(batch.unsqueeze(0).transpose(0, 1), search)
-                    hyps.append(batch_output)
-                print("Debug: batch output", batch_output)
-                
+                hyps, _, _, _ = search(enc_out.detach(), wav_lens)
                 # generate speech and transcriptions
                 wavs = []
                 tgt_texts = []
@@ -153,28 +116,7 @@ class S2UT(sb.core.Brain):
             p_seq,
             wavs,
             transcripts,
-            net_output,
         )
-    
-    def generate(self, enc_out, search):
-        # enc_out_encoder_format = enc_out.transpose(0, 1)
-        output_seq = []
-        read_step = 0
-        src_len = enc_out.size(0)
-        write_step = 0
-        while True:
-            if read_step <= src_len:
-                output = search.output_judge(enc_out.detach())
-            else:
-                output = True
-            if output:
-                token = search.predict()
-                output_seq.append(token)
-                write_step += 1
-            if token == self.hparams.eos_index or write_step >= 2500:
-                break
-            read_step += 1
-        return output_seq
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs.
@@ -191,15 +133,13 @@ class S2UT(sb.core.Brain):
         loss : torch.Tensor
             A one-element tensor used for backpropagating the gradient.
         """
-        # raise KeyboardInterrupt()
-        (p_seq, wavs, transcripts, net_output) = predictions
+        (p_seq, wavs, transcripts) = predictions
         tokens_eos, tokens_eos_lens = batch.code_eos
         ids = batch.id
 
         # speech translation loss
-        loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens, net_output=net_output)
-        print("Debug: loss", loss)
-        # raise KeyboardInterrupt()
+        loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens)
+
         if stage != sb.Stage.TRAIN:
             if (
                 stage == sb.Stage.TEST
@@ -249,19 +189,16 @@ class S2UT(sb.core.Brain):
                 self.modules.wav2vec2.parameters()
             )
             self.optimizers_dict["wav2vec_optimizer"] = self.wav2vec_optimizer
-            self.trainable_params = self.modules.parameters()
-        else:
-            self.trainable_params = self.hparams.model.parameters()
+
         self.model_optimizer = self.hparams.opt_class(
             self.hparams.model.parameters()
         )
         self.optimizers_dict["model_optimizer"] = self.model_optimizer
 
         if self.checkpointer is not None:
-            if not self.hparams.wav2vec2_frozen:
-                self.checkpointer.add_recoverable(
-                    "wav2vec_optimizer", self.wav2vec_optimizer
-                )
+            self.checkpointer.add_recoverable(
+                "wav2vec_optimizer", self.wav2vec_optimizer
+            )
             self.checkpointer.add_recoverable(
                 "model_optimizer", self.model_optimizer
             )
@@ -297,7 +234,6 @@ class S2UT(sb.core.Brain):
         should_step : boolean
             Whether optimizer.step() was called or not.
         """
-        print("Debug: batch!!!!!!!!!!!!!!!!!!!!!")
         if should_step:
             # anneal model lr every update
             self.hparams.noam_annealing(self.model_optimizer)
@@ -382,13 +318,13 @@ class S2UT(sb.core.Brain):
             lr_model = self.hparams.noam_annealing.current_lr
             lr_wav2vec = 0.0
 
-            if not self.hparams.wav2vec2_frozen:
-                (lr_wav2vec, new_lr_wav2vec) = self.hparams.wav2vec_annealing(
-                    stage_stats["ACC"]
-                )
-                sb.nnet.schedulers.update_learning_rate(
-                    self.wav2vec_optimizer, new_lr_wav2vec
-                )
+            # if not self.hparams.wav2vec2_frozen:
+            #     (lr_wav2vec, new_lr_wav2vec) = self.hparams.wav2vec_annealing(
+            #         stage_stats["ACC"]
+            #     )
+            #     sb.nnet.schedulers.update_learning_rate(
+            #         self.wav2vec_optimizer, new_lr_wav2vec
+            #     )
 
             self.hparams.train_logger.log_stats(
                 stats_meta={
@@ -676,9 +612,6 @@ if __name__ == "__main__":
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
     )
-    print(s2ut_brain.modules.wav2vec2)
-    wav2vec2_path = "/mmfs1/gscratch/intelligentsystems/randy/speechbrain/recipes/CVSS/S2ST/results/s2ut/888/save/CKPT+2024-06-13+14-04-09+00/wav2vec2.ckpt"
-    s2ut_brain.modules.wav2vec2.load_state_dict(torch.load(wav2vec2_path))
 
     train_dataloader_opts = hparams["train_dataloader_opts"]
     valid_dataloader_opts = hparams["valid_dataloader_opts"]
@@ -690,13 +623,13 @@ if __name__ == "__main__":
             "collate_fn": hparams["train_dataloader_opts"]["collate_fn"],
         }
 
-    s2ut_brain.fit(
-        s2ut_brain.hparams.epoch_counter,
-        datasets["train"],
-        datasets["valid_small"],
-        train_loader_kwargs=train_dataloader_opts,
-        valid_loader_kwargs=valid_dataloader_opts,
-    )
+    # s2ut_brain.fit(
+    #     s2ut_brain.hparams.epoch_counter,
+    #     datasets["train"],
+    #     datasets["valid_small"],
+    #     train_loader_kwargs=train_dataloader_opts,
+    #     valid_loader_kwargs=valid_dataloader_opts,
+    # )
 
     test_dataloader_opts = {
         "batch_size": 5,

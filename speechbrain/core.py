@@ -723,7 +723,6 @@ class Brain:
         for module in self.modules:
             if hasattr(self.modules[module], "to"):
                 self.modules[module] = self.modules[module].to(self.device)
-
         # Make hyperparams available with dot notation too
         if hparams is not None:
             self.hparams = SimpleNamespace(**hparams)
@@ -1141,13 +1140,13 @@ class Brain:
         """
 
         all_params = self.modules.parameters()
-
+        
         if self.opt_class is not None:
             if self.remove_vector_weight_decay:
                 all_params = rm_vector_weight_decay(self.modules)
 
             self.optimizer = self.opt_class(all_params)
-
+            self.trainable_params = all_params
             self.optimizers_dict = {"opt_class": self.optimizer}
 
             if self.checkpointer is not None:
@@ -1225,18 +1224,21 @@ class Brain:
             else:
                 outputs = self.compute_forward(batch, sb.Stage.TRAIN)
                 loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
-
+            
             scaled_loss = self.scaler.scale(
-                loss / self.grad_accumulation_factor
+                #loss / self.grad_accumulation_factor
+                loss[0] / self.grad_accumulation_factor
             )
             self.check_loss_isfinite(scaled_loss)
             scaled_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.trainable_params, 2)
 
         if should_step:
             self.optimizers_step()
 
         self.on_fit_batch_end(batch, outputs, loss, should_step)
-        return loss.detach().cpu()
+        # return loss.detach().cpu()
+        return loss[0].detach().cpu()
 
     def check_loss_isfinite(self, loss):
         """Check if the loss is finite.
@@ -1758,6 +1760,7 @@ class Brain:
         -------
         average test loss
         """
+        import time
         if progressbar is None:
             progressbar = not self.noprogressbar
 
@@ -1767,12 +1770,14 @@ class Brain:
         ):
             test_loader_kwargs["ckpt_prefix"] = None
             test_set = self.make_dataloader(
-                test_set, Stage.TEST, **test_loader_kwargs
+                test_set, Stage.VALID, **test_loader_kwargs
             )
         self.on_evaluate_start(max_key=max_key, min_key=min_key)
         self.on_stage_start(Stage.TEST, epoch=None)
         self.modules.eval()
         avg_test_loss = 0.0
+        start_time = time.time()  # debug start time
+
         with torch.no_grad():
             for batch in tqdm(
                 test_set,
@@ -1787,8 +1792,11 @@ class Brain:
                 # Debug mode only runs a few batches
                 if self.debug and self.step == self.debug_batches:
                     break
+                if time.time() - start_time > 120:
+                    print("Evaluation time exceeded 2 minutes, stopping early.")
+                    break
 
-            self.on_stage_end(Stage.TEST, avg_test_loss, None)
+            self.on_stage_end(Stage.VALID, avg_test_loss, 5)
         self.step = 0
         return avg_test_loss
 

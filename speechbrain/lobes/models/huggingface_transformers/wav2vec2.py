@@ -168,12 +168,12 @@ class Wav2Vec2(HFTransformersInterface):
         out : torch.Tensor
             Wav2vec encoded features.
         """
+        print("wav shape", wav.shape)
 
         padding_mask = make_padding_masks(wav, wav_len=wav_lens)
 
         if self.normalize_wav:
             wav = F.layer_norm(wav, wav.shape[1:])
-
         # Extract wav2vec output
         out = self.model(
             wav,
@@ -191,7 +191,8 @@ class Wav2Vec2(HFTransformersInterface):
         # We normalize the output if required
         if self.output_norm:
             out = F.layer_norm(out, norm_shape[1:])
-
+        print("out shape", out.shape)
+        raise KeyboardInterrupt()
         return out
 
 

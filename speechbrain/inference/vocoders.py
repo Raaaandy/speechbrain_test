@@ -313,6 +313,7 @@ class UnitHIFIGAN(Pretrained):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.infer = self.hparams.generator.inference
+        self.unit_embedding = self.hparams.generator.unit_embedding
         self.first_call = True
         # Temporary fix for mapping indices from the range [0, k] to [1, k+1]
         self.tokenize = True
@@ -375,8 +376,12 @@ class UnitHIFIGAN(Pretrained):
 
         # Increment units if tokenization is enabled
         if self.tokenize:
+            # print("add 1")
             # Avoid changing the input in-place
             units = units + 1
+
+        ## avoid out of index
+        units[units >= 101] = 100
         with torch.no_grad():
             waveform = self.infer(units.unsqueeze(0).to(self.device))
         return waveform.squeeze(0)

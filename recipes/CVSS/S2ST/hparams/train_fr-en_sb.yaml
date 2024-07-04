@@ -1,3 +1,4 @@
+
 ############################################################################
 # Model: Speech-to-Unit Translation (S2UT)
 # Language: French-English (Fr-En)
@@ -8,7 +9,7 @@
 ###################################
 # Experiment Parameters and setup #
 ###################################
-seed: 123
+seed: 888
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 output_folder: !ref results/s2ut/<seed>
 save_folder: !ref <output_folder>/save
@@ -18,9 +19,9 @@ epochs: 30
 progress_samples: True
 progress_sample_path: !ref <output_folder>/samples
 progress_samples_interval: 1
-progress_batch_sample_size: 5
+progress_batch_sample_size: 4
 
-evaluation_interval: 1
+evaluation_interval: 4
 
 #################################
 # Data files and pre-processing #
@@ -56,16 +57,13 @@ wav2vec2_source: LeBenchmark/wav2vec2-FR-7K-large
 wav2vec2_download_path: !ref <save_folder>/pretrained_models
 
 # wav2vec2 encoder specific parameters
-wav2vec2_frozen: True
+wav2vec2_frozen: False
 wav2vec2_freeze_steps: 10000
 
 ####################### Training Parameters ####################################
-# lr_warmup: 0.0000001
-lr: 0.0000001
-# lr: 0.0005
+lr: 0.0005
 lr_wav2vec: 0.00001
 loss_reduction: batchmean
-ckpt_interval_steps: 1814
 
 # Outputs
 # blank_index: 102
@@ -78,7 +76,7 @@ label_smoothing: 0.2
 sorting: random
 num_workers: 4
 dynamic_batching: True
-max_batch_len: 90 # 40 GB GPU
+max_batch_len: 180 # 40 GB GPU
 num_bucket: 200
 
 train_batch_size: 32 # if not using dynamic batching
@@ -149,23 +147,19 @@ enc: !new:speechbrain.nnet.CNN.Conv1d
     kernel_size: !ref <enc_kernel_size>
     stride: !ref <enc_stride>
 
-transformer: !new:speechbrain.lobes.models.models.transformer_monotonic_attention.TransformerMonotonicDecoder # yamllint disable-line rule:line-length
-    # input_size: !ref <embedding_size>
-    # tgt_vocab: !ref <output_neurons>
-    # d_model: !ref <d_model>
-    # nhead: !ref <nhead>
-    # num_encoder_layers: !ref <num_encoder_layers>
-    # num_decoder_layers: !ref <num_decoder_layers>
-    # d_ffn: !ref <d_ffn>
-    # dropout: !ref <transformer_dropout>
-    # activation: !ref <activation>
-    # attention_type: !ref <attention_type>
-    # normalize_before: True
-    # causal: False
-    args: null
-    dictionary: null
-    embed_tokens: null
-
+transformer: !new:speechbrain.lobes.models.transformer.TransformerST.TransformerST # yamllint disable-line rule:line-length
+    input_size: !ref <embedding_size>
+    tgt_vocab: !ref <output_neurons>
+    d_model: !ref <d_model>
+    nhead: !ref <nhead>
+    num_encoder_layers: !ref <num_encoder_layers>
+    num_decoder_layers: !ref <num_decoder_layers>
+    d_ffn: !ref <d_ffn>
+    dropout: !ref <transformer_dropout>
+    activation: !ref <activation>
+    attention_type: !ref <attention_type>
+    normalize_before: True
+    causal: False
 
 log_softmax: !new:speechbrain.nnet.activations.Softmax
     apply_log: True
@@ -178,9 +172,10 @@ modules:
     wav2vec2: !ref <wav2vec2>
     enc: !ref <enc>
     transformer: !ref <transformer>
+    seq_lin: !ref <seq_lin>
 
 model: !new:torch.nn.ModuleList
-    - [!ref <enc>, !ref <transformer>]
+    - [!ref <enc>, !ref <transformer>, !ref <seq_lin>]
 
 opt_class: !name:torch.optim.AdamW
     lr: !ref <lr>
@@ -189,7 +184,7 @@ opt_class: !name:torch.optim.AdamW
 wav2vec_opt_class: !name:torch.optim.AdamW
     lr: !ref <lr_wav2vec>
 
-seq_cost: !name:speechbrain.nnet.losses.latency_loss
+seq_cost: !name:speechbrain.nnet.losses.nll_loss
     label_smoothing: !ref <label_smoothing>
     reduction: !ref <loss_reduction>
 
@@ -209,23 +204,21 @@ epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
-valid_search: !new:speechbrain.decoders.seq2seq.StreamingAgent
-    modules: [!ref <transformer>, !ref <wav2vec2>, !ref <enc>, !ref <seq_lin>]
+valid_search: !new:speechbrain.decoders.seq2seq.S2STransformerGreedySearcher
+    modules: [!ref <transformer>, !ref <seq_lin>, null]
     bos_index: !ref <bos_index>
     eos_index: !ref <eos_index>
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+    temperature: 1.0
 
-
-test_search: !new:speechbrain.decoders.seq2seq.StreamingAgent
-# test_search: !new:speechbrain.decoders.seq2seq.S2STransformerBeamSearcher
-    # modules: [!ref <transformer>, !ref <seq_lin>]
-    # bos_index: !ref <bos_index>
-    # eos_index: !ref <eos_index>
-    # min_decode_ratio: !ref <min_decode_ratio>
-    # max_decode_ratio: !ref <max_decode_ratio>
-    # beam_size: !ref <test_bs>
-    modules: [!ref <transformer>, !ref <wav2vec2>, !ref <enc>, !ref <seq_lin>]
+test_search: !new:speechbrain.decoders.seq2seq.S2STransformerBeamSearcher
+    modules: [!ref <transformer>, !ref <seq_lin>]
     bos_index: !ref <bos_index>
     eos_index: !ref <eos_index>
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+    beam_size: !ref <test_bs>
 
 acc_computer: !name:speechbrain.utils.Accuracy.AccuracyStats
 bleu_computer: !name:speechbrain.utils.bleu.BLEUStats

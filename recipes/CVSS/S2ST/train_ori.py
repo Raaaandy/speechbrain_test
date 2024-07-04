@@ -44,60 +44,30 @@ class S2UT(sb.core.Brain):
             The outputs after all processing is complete.
         """
         batch = batch.to(self.device)
-        attributes = dir(batch)
-        attributes = [attr for attr in attributes if not (attr.startswith('__') and attr.endswith('__'))]
-        for attr in attributes:
-            print(f"{attr}: {getattr(batch, attr)}")
         wavs, wav_lens = batch.src_sig
-        ## wave padding idx
-
-
         tokens_bos, _ = batch.code_bos
 
         # Use default padding value for wav2vec2
         wavs[wavs == self.hparams.pad_index] = 0.0
-        preprocess
+
         # compute features
         enc_out = self.modules.wav2vec2(wavs, wav_lens)
 
-        if (torch.isnan(enc_out).any()):
-            raise KeyboardInterrupt("wav2vec2 enc_out")
-        for name, param in self.modules.enc.named_parameters():
-            if torch.isnan(param).any():
-                print(f"Parameter '{name}' contains NaN values.")
-                # raise KeyboardInterrupt("module weights contain NaN values")
         # dimensionality reduction
         enc_out = self.modules.enc(enc_out)
 
-        
-        if (torch.isnan(enc_out).any()):
-            print(enc_out.shape)
-            raise KeyboardInterrupt("enc enc_out")
-        ## make input compatible with transformer
-        enc_out = enc_out.transpose(0, 1)
-        bsz = enc_out.size(0)
-
         if isinstance(self.modules.transformer, DistributedDataParallel):
-            dec_out, atten = self.modules.transformer.module(prev_output_tokens=tokens_bos, encoder_out=enc_out)
-            print()
-            # dec_out = self.modules.transformer.module.forward_mt_decoder_only(
-            #     enc_out, tokens_bos, pad_idx=self.hparams.pad_index
-            # )
+            dec_out = self.modules.transformer.module.forward_mt_decoder_only(
+                enc_out, tokens_bos, pad_idx=self.hparams.pad_index
+            )
         else:
-            if (torch.isnan(tokens_bos).any()):
-                raise KeyboardInterrupt("train.compute forward token bos")
-            if (torch.isnan(enc_out).any()):
-                raise KeyboardInterrupt("train.compute forward encoder out")
-            net_output = self.modules.transformer(prev_output_tokens=tokens_bos, encoder_out=enc_out)
-            
-            # dec_out = self.modules.transformer.forward_mt_decoder_only(
-            #     enc_out, tokens_bos, pad_idx=self.hparams.pad_index
-            # )
-        p_seq = self.modules.transformer.get_normalized_probs(net_output, log_probs=True)
-        print("dec out greater than 0",p_seq.ge(0).all())
-        atten = net_output[1]
+            dec_out = self.modules.transformer.forward_mt_decoder_only(
+                enc_out, tokens_bos, pad_idx=self.hparams.pad_index
+            )
+
         # logits and softmax
-        # p_seq = dec_out
+        pred = self.modules.seq_lin(dec_out)
+        p_seq = self.hparams.log_softmax(pred)
 
         hyps = None
         wavs = None
@@ -117,27 +87,15 @@ class S2UT(sb.core.Brain):
                     if stage == sb.Stage.VALID
                     else self.hparams.test_search
                 )
-                # print(enc_out.shape)
-                # print(len(tgt_text), tgt_text)
-                # hyps, _, _, _ = search(enc_out.detach(), wav_lens)
-                # print("Debug: enc_out", enc_out.detach().size())
-                hyps = []
-                for batch in enc_out.transpose(0, 1):
-                    batch_output = self.generate(batch.unsqueeze(0).transpose(0, 1), search)
-                    hyps.append(batch_output)
-                print("Debug: batch output", batch_output)
-                
+                hyps, _, _, _ = search(enc_out.detach(), wav_lens)
+
                 # generate speech and transcriptions
                 wavs = []
-                tgt_texts = []
-                assert(len(hyps) == len(tgt_text))
-                for j, hyp in enumerate(hyps):
-                    # print(len(hyp), hyp)
-                    if len(hyp) > 5: #3
+                for hyp in hyps:
+                    if len(hyp) > 3:
                         code = torch.LongTensor(hyp)
                         wav = self.test_vocoder.decode_unit(code)
                         wavs.append(wav.squeeze(0))
-                        tgt_texts.append(tgt_text[j])
                 if wavs:
                     wavs, wav_lens = sb.utils.data_utils.batch_pad_right(wavs)
                     transcripts, _ = self.test_asr.transcribe_batch(
@@ -147,34 +105,13 @@ class S2UT(sb.core.Brain):
                         transcript.lower() for transcript in transcripts
                     ]
 
-                    self.bleu_metric.append(ids, transcripts, [tgt_texts])
+                    self.bleu_metric.append(ids, transcripts, [tgt_text])
 
         return (
             p_seq,
             wavs,
             transcripts,
-            net_output,
         )
-    
-    def generate(self, enc_out, search):
-        # enc_out_encoder_format = enc_out.transpose(0, 1)
-        output_seq = []
-        read_step = 0
-        src_len = enc_out.size(0)
-        write_step = 0
-        while True:
-            if read_step <= src_len:
-                output = search.output_judge(enc_out.detach())
-            else:
-                output = True
-            if output:
-                token = search.predict()
-                output_seq.append(token)
-                write_step += 1
-            if token == self.hparams.eos_index or write_step >= 2500:
-                break
-            read_step += 1
-        return output_seq
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs.
@@ -191,15 +128,13 @@ class S2UT(sb.core.Brain):
         loss : torch.Tensor
             A one-element tensor used for backpropagating the gradient.
         """
-        # raise KeyboardInterrupt()
-        (p_seq, wavs, transcripts, net_output) = predictions
+        (p_seq, wavs, transcripts) = predictions
         tokens_eos, tokens_eos_lens = batch.code_eos
         ids = batch.id
 
         # speech translation loss
-        loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens, net_output=net_output)
-        print("Debug: loss", loss)
-        # raise KeyboardInterrupt()
+        loss = self.hparams.seq_cost(p_seq, tokens_eos, length=tokens_eos_lens)
+
         if stage != sb.Stage.TRAIN:
             if (
                 stage == sb.Stage.TEST
@@ -249,19 +184,16 @@ class S2UT(sb.core.Brain):
                 self.modules.wav2vec2.parameters()
             )
             self.optimizers_dict["wav2vec_optimizer"] = self.wav2vec_optimizer
-            self.trainable_params = self.modules.parameters()
-        else:
-            self.trainable_params = self.hparams.model.parameters()
+
         self.model_optimizer = self.hparams.opt_class(
             self.hparams.model.parameters()
         )
         self.optimizers_dict["model_optimizer"] = self.model_optimizer
 
         if self.checkpointer is not None:
-            if not self.hparams.wav2vec2_frozen:
-                self.checkpointer.add_recoverable(
-                    "wav2vec_optimizer", self.wav2vec_optimizer
-                )
+            self.checkpointer.add_recoverable(
+                "wav2vec_optimizer", self.wav2vec_optimizer
+            )
             self.checkpointer.add_recoverable(
                 "model_optimizer", self.model_optimizer
             )
@@ -297,7 +229,6 @@ class S2UT(sb.core.Brain):
         should_step : boolean
             Whether optimizer.step() was called or not.
         """
-        print("Debug: batch!!!!!!!!!!!!!!!!!!!!!")
         if should_step:
             # anneal model lr every update
             self.hparams.noam_annealing(self.model_optimizer)
@@ -375,8 +306,8 @@ class S2UT(sb.core.Brain):
                 and epoch % self.hparams.progress_samples_interval == 0
             )
 
-            # if output_progress_sample:
-            self._save_progress_sample(epoch)
+            if output_progress_sample:
+                self._save_progress_sample(epoch)
 
             current_epoch = self.hparams.epoch_counter.current
             lr_model = self.hparams.noam_annealing.current_lr
@@ -396,8 +327,7 @@ class S2UT(sb.core.Brain):
                     "lr_model": lr_model,
                     "lr_wav2vec": lr_wav2vec,
                 },
-                # train_stats={"loss": self.train_stats},
-                train_stats = {"loss": 5},
+                train_stats={"loss": self.train_stats},
                 valid_stats=stage_stats,
             )
 
@@ -420,10 +350,6 @@ class S2UT(sb.core.Brain):
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
             )
-
-            # copy from VALID part
-            self._save_progress_sample(0)
-
 
             logger.info(
                 f"BLEU score: {round(self.bleu_metric.summarize('BLEU'), 2)}"
@@ -467,7 +393,7 @@ class S2UT(sb.core.Brain):
             transcript = transcripts[i]
             tgt_transcript = tgt_transcripts[i]
             tgt_wav = tgt_wavs[i]
-            print(f"Debug: tgt_wave: {tgt_wav.size()}")
+
             sample_path = save_folder / f"{utt_id}_pred.wav"
             sb.dataio.dataio.write_audio(
                 sample_path, wav, self.hparams.sample_rate
@@ -668,7 +594,7 @@ if __name__ == "__main__":
     )
 
     datasets, train_bsampler = dataio_prepare(hparams)
-    # print(type(datasets["train"]))
+
     s2ut_brain = S2UT(
         modules=hparams["modules"],
         opt_class=hparams["opt_class"],
@@ -676,9 +602,6 @@ if __name__ == "__main__":
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
     )
-    print(s2ut_brain.modules.wav2vec2)
-    wav2vec2_path = "/mmfs1/gscratch/intelligentsystems/randy/speechbrain/recipes/CVSS/S2ST/results/s2ut/888/save/CKPT+2024-06-13+14-04-09+00/wav2vec2.ckpt"
-    s2ut_brain.modules.wav2vec2.load_state_dict(torch.load(wav2vec2_path))
 
     train_dataloader_opts = hparams["train_dataloader_opts"]
     valid_dataloader_opts = hparams["valid_dataloader_opts"]
@@ -699,11 +622,10 @@ if __name__ == "__main__":
     )
 
     test_dataloader_opts = {
-        "batch_size": 5,
+        "batch_size": 1,
     }
 
     for dataset in ["valid", "test"]:
-        print("[Debug]:", datasets[dataset])
         s2ut_brain.evaluate(
             datasets[dataset],
             max_key="BLEU",
